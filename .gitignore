@@ -1,7 +1,10 @@
 # Local test data (created by scripts/make-images.sh)
 /data/
+/data-fault/
 /state/
 .e2e-work/
+# Repair staging files
+.*.repair-*.stage
 # Python
 __pycache__/
 *.pyc

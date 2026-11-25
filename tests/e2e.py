@@ -192,6 +192,46 @@ def capacities(*images: Path) -> Dict[str, int]:
     return out
 
 
+def sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def corrupt_primary_magic(image: Path) -> None:
+    """Zero the two s_magic bytes at 1024 + 0x38 (= 1080)."""
+    with image.open("r+b") as fh:
+        fh.seek(1024 + 56)
+        assert fh.read(2) == b"\x53\xef", "precondition: image has ext4 magic"
+        fh.seek(1024 + 56)
+        fh.write(b"\x00\x00")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def build_custom_image(
+    image: Path, seed_dir: Path, mib: int, block_size: int = 4096,
+    groupsize: Optional[int] = None, label: str = "disk1",
+) -> None:
+    """Create a seeded image with explicit geometry (real mkfs.ext4)."""
+    cmd = [
+        "mkfs.ext4", "-q", "-F", "-b", str(block_size),
+        "-L", label, "-d", str(seed_dir),
+    ]
+    if groupsize is not None:
+        cmd += ["-g", str(groupsize)]
+    cmd += [str(image), f"{mib}M"]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
+    subprocess.run(["truncate", "-s", f"{mib}M", str(image)], check=True)
+    subprocess.run(["e2fsck", "-f", "-y", str(image)], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # ---------------------------------------------------------------------------
 # Scenario 1: two disks competing for the quota
 # ---------------------------------------------------------------------------
@@ -476,6 +516,375 @@ def scenario_validation(work: Path, seed: Path) -> None:
         svc.stop()
 
 
+# ---------------------------------------------------------------------------
+# Scenario 4: superblock repair -- marking, quota, concurrency, content
+# ---------------------------------------------------------------------------
+
+
+def scenario_superblock_repair(work: Path, seed: Path) -> None:
+    print("\n=== scenario 4: primary superblock magic corruption + repair ===")
+    data = work / "s4" / "data"
+    data.mkdir(parents=True)
+    build_images(data, seed)
+    d1, d2 = data / "disk1.ext4", data / "disk2.ext4"
+    # Default 32 MiB/4k images have one group and no backup SB; rebuild disk1
+    # with compact geometry that places a backup at block 4096.
+    build_custom_image(d1, seed / "disk1", mib=32, groupsize=4096)
+    backup = 4096
+
+    inventory_before = image_snapshot(d1, d2)
+    length_before = d1.stat().st_size
+    corrupt_primary_magic(d1)
+    sha_corrupt = sha256_file(d1)
+
+    q = 160
+    svc = Service(
+        data,
+        work / "s4" / "state" / "state.db",
+        quota=q,
+        extra_env={"DISK_REPAIR_DELAY_MS": "1500"},
+    )
+    try:
+        wait_ready()  # service must start despite the bad disk
+
+        status, body = http("GET", "/disks")
+        by_id = {d["disk"]: d for d in body["disks"]}
+        bad, good = by_id["disk1"], by_id["disk2"]
+        check(
+            "service starts with a bad disk and GET /disks marks the fault",
+            bad["healthy"] is False
+            and bool(bad["fault"])
+            and bad["superblock_magic_ok"] is False
+            and bad["corrupted"] is True,
+            {k: bad.get(k) for k in ("healthy", "fault", "corrupted", "state")},
+        )
+        check(
+            "healthy disk is reported healthy",
+            good["healthy"] is True and good["fault"] is None,
+            good.get("fault"),
+        )
+        check(
+            "bad disk is still quota-charged by its file length",
+            bad["image_length_mib"] == 32
+            and bad["quota_charge_mib"] == 32
+            and body["used_mib"] == 64,
+            {"disk1_charge": bad["quota_charge_mib"], "used": body["used_mib"]},
+        )
+
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            repair_future = pool.submit(
+                http,
+                "POST",
+                "/disks/disk1/repair",
+                {"backup_superblock": backup},
+                60,
+            )
+            time.sleep(0.5)
+            _, during = http("GET", "/disks/disk1")
+            check(
+                "repair is marked in flight",
+                during["repair_in_flight"] is True,
+                during["repair_in_flight"],
+            )
+            busy_status, busy_body = http(
+                "POST", "/disks/disk1/resize", {"target_mib": 48}
+            )
+            check(
+                "expansion of the repairing disk is rejected with 409 disk_busy",
+                busy_status == 409
+                and busy_body["detail"]["error"] == "disk_busy",
+                busy_body,
+            )
+            # The other disk is unaffected: 32 (disk1 length) + 64 <= 160.
+            other_status, other_body = http(
+                "POST", "/disks/disk2/resize", {"target_mib": 64}, 120
+            )
+            check(
+                "the other disk is quota-admitted and expands while repair runs",
+                other_status == 200
+                and other_body["status"] == "succeeded"
+                and other_body["result"]["ext4_capacity_mib"] == 64,
+                {"status": other_status,
+                 "body": other_body if other_status != 200 else other_body["status"]},
+            )
+            rep_status, rep_body = repair_future.result()
+
+        check(
+            "repair request succeeds",
+            rep_status == 200
+            and rep_body["status"] == "succeeded"
+            and rep_body["backup_superblock"] == backup
+            and rep_body["read_only_primary_check_passed"] is True,
+            {"status": rep_status,
+             "body": rep_body if rep_status != 200 else rep_body["status"]},
+        )
+        check(
+            "capacity is queryable again under the same disk id and length is unchanged",
+            rep_body["result"]["healthy"] is True
+            and rep_body["result"]["fault"] is None
+            and rep_body["result"]["ext4_capacity_mib"] == 32
+            and rep_body["result"]["image_length_bytes"] == length_before,
+            rep_body.get("result"),
+        )
+        _, after = http("GET", "/disks")
+        by_id = {d["disk"]: d for d in after["disks"]}
+        check(
+            "final status: disk1 healthy 32 MiB, disk2 expanded to 64 MiB",
+            by_id["disk1"]["healthy"] is True
+            and by_id["disk1"]["ext4_capacity_mib"] == 32
+            and by_id["disk2"]["ext4_capacity_mib"] == 64,
+            {k: (v["healthy"], v["ext4_capacity_mib"]) for k, v in by_id.items()},
+        )
+        check(
+            "original files remain readable and unchanged after repair",
+            snapshot_files_equal(inventory_before, image_snapshot(d1, d2)),
+            "sha256 of every file compared",
+        )
+        check(
+            "repaired image differs from the corrupted one (replacement happened)",
+            sha256_file(d1) != sha_corrupt,
+            None,
+        )
+    finally:
+        svc.stop()
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5: repair guards -- bad backup, non-4k, missing field, busy
+# ---------------------------------------------------------------------------
+
+
+def scenario_repair_guards(work: Path, seed: Path) -> None:
+    print("\n=== scenario 5: repair validation and byte preservation ===")
+    data = work / "s5" / "data"
+    data.mkdir(parents=True)
+    build_images(data, seed)
+    d1, d2 = data / "disk1.ext4", data / "disk2.ext4"
+    build_custom_image(d1, seed / "disk1", mib=32, groupsize=4096)
+    corrupt_primary_magic(d1)
+    sha_before = sha256_file(d1)
+
+    svc = Service(data, work / "s5" / "state" / "state.db", quota=160)
+    try:
+        wait_ready()
+        st, body = http("POST", "/disks/disk1/repair", {})
+        check("missing backup number is rejected 422", st == 422, st)
+
+        st, body = http(
+            "POST", "/disks/disk1/repair", {"backup_superblock": 999999}
+        )
+        check(
+            "invalid backup number is rejected 422",
+            st == 422 and body["detail"]["error"] == "invalid_backup_superblock",
+            {"status": st, "detail": body.get("detail")},
+        )
+        check(
+            "invalid repair leaves the original image byte-for-byte intact",
+            sha256_file(d1) == sha_before,
+            None,
+        )
+
+        # Healthy disk must not be "repaired".
+        st, body = http(
+            "POST", "/disks/disk2/repair", {"backup_superblock": 32768}
+        )
+        check(
+            "repair of a healthy disk is refused 409 disk_healthy",
+            st == 409 and body["detail"]["error"] == "disk_healthy",
+            {"status": st, "error": body.get("detail", {}).get("error")},
+        )
+
+        # Unknown disk.
+        check(
+            "repair of unknown disk is 404",
+            http("POST", "/disks/nope/repair", {"backup_superblock": 1})[0] == 404,
+            None,
+        )
+    finally:
+        svc.stop()
+
+    # Non-4-KiB image: 1 KiB blocks with a real backup at 8193.
+    data1k = work / "s5b" / "data"
+    data1k.mkdir(parents=True)
+    build_images(data1k, seed)
+    d1k = data1k / "disk1.ext4"
+    build_custom_image(d1k, seed / "disk1", mib=64, block_size=1024)
+    corrupt_primary_magic(d1k)
+    sha_1k = sha256_file(d1k)
+    svc = Service(data1k, work / "s5b" / "state" / "state.db", quota=160)
+    try:
+        wait_ready()
+        st, body = http(
+            "POST", "/disks/disk1/repair", {"backup_superblock": 8193}
+        )
+        check(
+            "non-4-KiB image is rejected with unsupported_block_size",
+            st == 422
+            and body["detail"]["error"] == "unsupported_block_size"
+            and body["detail"]["block_size"] == 1024,
+            {"status": st, "detail": body.get("detail")},
+        )
+        check(
+            "non-4-KiB image is untouched by the rejected repair",
+            sha256_file(d1k) == sha_1k,
+            None,
+        )
+    finally:
+        svc.stop()
+
+    # Unfinished expansion blocks repair.
+    data_busy = work / "s5c" / "data"
+    data_busy.mkdir(parents=True)
+    build_images(data_busy, seed)
+    svc = Service(
+        data_busy,
+        work / "s5c" / "state" / "state.db",
+        quota=160,
+        extra_env={"DISK_EXTEND_DELAY_MS": "1200"},
+    )
+    try:
+        wait_ready()
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            f = pool.submit(http, "POST", "/disks/disk1/resize",
+                            {"target_mib": 80}, 60)
+            time.sleep(0.4)
+            st, body = http(
+                "POST", "/disks/disk1/repair", {"backup_superblock": 4096}
+            )
+            f.result()
+        check(
+            "repair is refused while an expansion is unfinished (409 disk_busy)",
+            st == 409
+            and body["detail"]["error"] == "disk_busy"
+            and body["detail"].get("reason") == "unfinished_expansion",
+            {"status": st, "detail": body.get("detail")},
+        )
+    finally:
+        svc.stop()
+
+
+# ---------------------------------------------------------------------------
+# Scenario 6: process exit before replacement -> bytes kept -> retry works
+# ---------------------------------------------------------------------------
+
+
+def scenario_repair_crash_retry(work: Path, seed: Path) -> None:
+    print("\n=== scenario 6: exit before replace preserves image, retry after restart ===")
+    data = work / "s6" / "data"
+    data.mkdir(parents=True)
+    build_images(data, seed)
+    d1 = data / "disk1.ext4"
+    build_custom_image(d1, seed / "disk1", mib=32, groupsize=4096)
+    inventory_before = image_snapshot(d1)
+    corrupt_primary_magic(d1)
+    sha_before = sha256_file(d1)
+    state = work / "s6" / "state" / "state.db"
+
+    svc = Service(
+        data, state, quota=160,
+        extra_env={"DISK_CRASH_BEFORE_REPLACE": "disk1"},
+    )
+    try:
+        wait_ready()
+        try:
+            status, _ = http(
+                "POST", "/disks/disk1/repair",
+                {"backup_superblock": 4096}, timeout=15,
+            )
+        except Exception:
+            status = 0
+        check(
+            "service exits before replacing the image (client sees drop)",
+            status == 0 and svc.proc.poll() is not None,
+            {"http_status": status, "exit": svc.proc.returncode},
+        )
+    finally:
+        svc.stop()
+
+    check(
+        "process hard-exited with 137",
+        svc.proc.returncode == 137,
+        svc.proc.returncode,
+    )
+    check(
+        "original image is byte-for-byte identical after the pre-replace exit",
+        sha256_file(d1) == sha_before,
+        {"before": sha_before[:16], "after": sha256_file(d1)[:16]},
+    )
+
+    # Restart without fault injection and retry the same repair.
+    svc = Service(data, state, quota=160)
+    try:
+        wait_ready()
+        st, body = http(
+            "POST", "/disks/disk1/repair", {"backup_superblock": 4096}, 60
+        )
+        check(
+            "repair retried after restart succeeds",
+            st == 200 and body["status"] == "succeeded"
+            and body["result"]["healthy"] is True,
+            {"status": st, "body": body if st != 200 else body["status"]},
+        )
+        check(
+            "files are intact after crash + retry",
+            snapshot_files_equal(inventory_before, image_snapshot(d1)),
+            "sha256 of every file compared",
+        )
+        repairs = http("GET", "/disks/disk1/repairs")[1]
+        check(
+            "repair history records the failed attempt and the success",
+            len(repairs["repairs"]) >= 2
+            and repairs["repairs"][0]["status"] == "succeeded",
+            [(j["status"], (j.get("message") or "")[:40]) for j in repairs["repairs"]],
+        )
+    finally:
+        svc.stop()
+
+
+# ---------------------------------------------------------------------------
+# Scenario 7: canonical standard geometry (256 MiB, backup @ 32768)
+# ---------------------------------------------------------------------------
+
+
+def scenario_repair_standard_geometry(work: Path, seed: Path) -> None:
+    print("\n=== scenario 7: standard 256 MiB geometry, backup superblock 32768 ===")
+    data = work / "s7" / "data"
+    data.mkdir(parents=True)
+    build_images(data, seed)
+    d1 = data / "disk1.ext4"
+    build_custom_image(d1, seed / "disk1", mib=256)  # default groups -> SB @32768
+    inventory_before = image_snapshot(d1)
+    length_before = d1.stat().st_size
+    corrupt_primary_magic(d1)
+
+    svc = Service(data, work / "s7" / "state" / "state.db", quota=320)
+    try:
+        wait_ready()
+        st, body = http(
+            "POST", "/disks/disk1/repair", {"superblock": 32768}, 120
+        )
+        check(
+            "canonical backup 32768 repairs the standard image",
+            st == 200
+            and body["status"] == "succeeded"
+            and body["result"]["ext4_capacity_mib"] == 256
+            and body["result"]["image_length_bytes"] == length_before,
+            {"status": st,
+             "body": body if st != 200 else body["result"]["ext4_capacity_mib"]},
+        )
+        check(
+            "files survive the standard-geometry repair",
+            snapshot_files_equal(inventory_before, image_snapshot(d1)),
+            "sha256 of every file compared",
+        )
+    finally:
+        svc.stop()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep", action="store_true", help="keep the temporary directory")
@@ -489,6 +898,10 @@ def main() -> int:
         scenario_quota_competition(work, seed)
         scenario_crash_resume(work, seed)
         scenario_validation(work, seed)
+        scenario_superblock_repair(work, seed)
+        scenario_repair_guards(work, seed)
+        scenario_repair_crash_retry(work, seed)
+        scenario_repair_standard_geometry(work, seed)
     except Exception:
         traceback.print_exc()
         results.append({"name": "harness crashed", "ok": False, "detail": traceback.format_exc()})

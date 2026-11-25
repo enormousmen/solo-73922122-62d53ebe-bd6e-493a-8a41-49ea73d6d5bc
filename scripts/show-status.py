@@ -17,11 +17,21 @@ def main() -> int:
         f" free {data['free_mib']} MiB"
     )
     for disk in data["disks"]:
+        flags = []
+        if disk.get("fault"):
+            flags.append(f"FAULT={disk['fault']}")
+        if disk.get("in_flight"):
+            flags.append("resize-in-flight")
+        if disk.get("repair_in_flight"):
+            flags.append("repair-in-flight")
+        flag_str = ("  [" + ", ".join(flags) + "]") if flags else ""
         print(
             f"  {disk['disk']}: image {disk['image_length_mib']} MiB,"
             f" ext4 {disk['ext4_capacity_mib']} MiB,"
             f" charged {disk['quota_charge_mib']} MiB,"
             f" in_flight {disk['in_flight']}"
+            f" healthy={disk.get('healthy', True)}"
+            f"{flag_str}"
         )
     return 0
 

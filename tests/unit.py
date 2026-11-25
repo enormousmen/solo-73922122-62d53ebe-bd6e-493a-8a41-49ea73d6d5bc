@@ -11,6 +11,7 @@ without touching a single real image.
 from __future__ import annotations
 
 import asyncio
+import struct
 import sys
 from pathlib import Path
 
@@ -246,6 +247,129 @@ def test_validation(tmp: Path) -> None:
     asyncio.run(body())
 
 
+# ---------------------------------------------------------------------------
+# Superblock repair helpers / admission
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_backup(path: Path, block: int, block_size: int = 4096) -> None:
+    log_bs = {1024: 0, 2048: 1, 4096: 2, 65536: 6}[block_size]
+    with path.open("r+b") as fh:
+        start = block * block_size
+        fh.seek(start + 0x38)
+        fh.write(b"\x53\xef")
+        fh.seek(start + 0x18)
+        fh.write(struct.pack("<I", log_bs))
+
+
+def _corrupt_magic(path: Path) -> None:
+    with path.open("r+b") as fh:
+        fh.seek(1024 + 56)
+        fh.write(b"\x00\x00")
+
+
+def test_parse_backup_superblock_4k(tmp: Path) -> None:
+    p = tmp / "img"
+    p.write_bytes(b"\0" * (32 * MIB))
+    _write_fake_backup(p, 4096, 4096)
+    info = main.parse_backup_superblock(p, 4096)
+    assert info is not None and info["block_size"] == 4096
+    assert main.primary_block_size(p) == 4096 or main.primary_block_size(p) == 1024
+
+
+def test_parse_backup_superblock_1k(tmp: Path) -> None:
+    p = tmp / "img"
+    p.write_bytes(b"\0" * (64 * MIB))
+    _write_fake_backup(p, 8193, 1024)
+    info = main.parse_backup_superblock(p, 8193)
+    assert info is not None and info["block_size"] == 1024
+
+
+def test_parse_backup_superblock_garbage(tmp: Path) -> None:
+    p = tmp / "img"
+    p.write_bytes(b"\0" * (32 * MIB))
+    assert main.parse_backup_superblock(p, 32768) is None
+    assert main.parse_backup_superblock(p, -1) is None
+
+
+def test_coerce_and_pick_keys(tmp: Path) -> None:
+    assert main._coerce_positive_int("32768") == 32768
+    assert main._coerce_positive_int(64.0) == 64
+    assert main._coerce_positive_int(True) is None
+    assert main._coerce_positive_int(0) is None
+    payload = {"Known-Backup-Superblock": "4096"}
+    assert main._coerce_positive_int(
+        main._pick_key(payload, main._SB_CANONICAL_KEYS)
+    ) == 4096
+
+
+def test_resize_rejected_on_faulted_disk(tmp: Path) -> None:
+    async def body():
+        svc, _ = make_service(tmp, quota=160)
+        _corrupt_magic(svc.disks["disk1"])
+        status = svc.status()
+        d1 = next(d for d in status["disks"] if d["disk"] == "disk1")
+        assert d1["healthy"] is False and d1["fault"] == main.FAULT_MAGIC_CORRUPT
+        # Quota still charged at the real file length (32 MiB).
+        assert d1["quota_charge_mib"] == 32
+        try:
+            await svc.request_resize("disk1", 80)
+            raise AssertionError("resize accepted on corrupt disk")
+        except main.HTTPException as exc:
+            assert exc.status_code == 409
+            assert exc.detail["error"] == "disk_fault"
+        svc.store.close()
+
+    asyncio.run(body())
+
+
+def test_repair_blocked_by_unfinished_expansion(tmp: Path) -> None:
+    async def body():
+        svc, _ = make_service(tmp, quota=160)
+        svc.store.begin_pending("disk1", "job-open", 80 * MIB)
+        try:
+            await svc.request_repair("disk1", 4096)
+            raise AssertionError("repair accepted with pending expansion")
+        except main.HTTPException as exc:
+            assert exc.status_code == 409
+            assert exc.detail["error"] == "disk_busy"
+            assert exc.detail["reason"] == "unfinished_expansion"
+        svc.store.close()
+
+    asyncio.run(body())
+
+
+def test_repair_admission_and_worker_with_fake_tools(tmp: Path) -> None:
+    async def body():
+        svc, _ = make_service(tmp, quota=160)
+        d1 = svc.disks["disk1"]
+        _corrupt_magic(d1)
+        _write_fake_backup(d1, 4096, 4096)
+
+        def fake_backup_repair(stage: Path, block: int, timeout: int) -> str:
+            # Stand in for `e2fsck -b`: restore the primary magic on stage.
+            with stage.open("r+b") as fh:
+                fh.seek(1024 + 56)
+                fh.write(b"\x53\xef")
+            return "fake e2fsck -b"
+
+        main.repair_stage_from_backup = fake_backup_repair
+        main.read_only_primary_check = lambda stage, timeout: "fake e2fsck -fn"
+
+        payload, task = await svc.request_repair("disk1", 4096)
+        assert payload["backup_superblock"] == 4096
+        await asyncio.gather(task)
+        job = svc.store.job(payload["job_id"])
+        assert job["status"] == "succeeded", job
+        state = svc.disk_status("disk1")
+        assert state["healthy"] is True and state["fault"] is None
+        assert state["image_length_mib"] == 32
+        assert not list(svc.settings.data_dir.glob(".disk1.repair-*.stage"))
+        svc.store.close()
+
+    asyncio.run(body())
+
+
 TESTS = [
     test_in_flight_charged_at_target,
     test_refusal_does_not_touch_image,
@@ -254,6 +378,13 @@ TESTS = [
     test_crash_before_extend_releases_reservation,
     test_per_disk_requests_are_independent,
     test_validation,
+    test_parse_backup_superblock_4k,
+    test_parse_backup_superblock_1k,
+    test_parse_backup_superblock_garbage,
+    test_coerce_and_pick_keys,
+    test_resize_rejected_on_faulted_disk,
+    test_repair_blocked_by_unfinished_expansion,
+    test_repair_admission_and_worker_with_fake_tools,
 ]
 
 

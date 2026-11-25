@@ -11,6 +11,9 @@ services:
       DISK_IMAGE_MIB: ${DISK_IMAGE_MIB:-32}
       DISK_EXTEND_DELAY_MS: ${DISK_EXTEND_DELAY_MS:-0}
       DISK_CRASH_AFTER_EXTEND: ${DISK_CRASH_AFTER_EXTEND:-}
+      # Repair demo/test hooks (both empty/0 in normal operation):
+      DISK_REPAIR_DELAY_MS: ${DISK_REPAIR_DELAY_MS:-0}
+      DISK_CRASH_BEFORE_REPLACE: ${DISK_CRASH_BEFORE_REPLACE:-}
       DISK_API_KEY: ${DISK_API_KEY:-}
       DISK_DATA_DIR: /data
       DISK_STATE_DB: /state/state.db

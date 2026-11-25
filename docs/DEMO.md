@@ -190,6 +190,152 @@ used/quota MiB: 128.0 / 160
 
 ---
 
+## 场景 C：主超级块魔数损坏 + 备用块离线修复
+
+```bash
+./scripts/demo-repair.sh
+```
+
+脚本会在临时目录里生成一张**带备用超级块**的 32 MiB / 4 KiB 镜像（`mkfs -g 4096`，
+备用块在 `4096`；默认几何的 32 MiB 镜像只有一个块组、没有备份，所以故障样盘要单独
+生成），只把主超级块偏移 1080 处的两个魔数字节 `53 ef` 改成 `00 00`，然后演示：
+带坏盘启动 → 查询标故障且按文件长度占配额 → 修盘中本盘拒扩、disk2 照常扩到 64 MiB →
+非法备用块号镜像不变 → 替换前硬退出 sha256 不变 → 重启重试成功、文件哈希不变。
+
+### 故障样盘的两种生成方式
+
+```bash
+# 方式一：紧凑几何（32 MiB，备份超级块在 block 4096，省配额）
+./scripts/make-fault-sample.sh /tmp/fault-data
+
+# 方式二：标准几何（256 MiB，经典备份在 block 32768）
+STANDARD=1 ./scripts/make-fault-sample.sh /tmp/fault-data
+
+# 也可以只损坏一张已有镜像并自动扫描可用备份块：
+python3 scripts/corrupt-superblock.py --json /path/to/disk1.ext4
+```
+
+### 请求序列
+
+```bash
+# 0) 起服务（本地）；Docker Compose 见下
+DISK_QUOTA_MIB=160 DISK_DATA_DIR=/tmp/fault-data \
+  DISK_STATE_DB=/tmp/fault-data/state.db \
+  DISK_REPAIR_DELAY_MS=1500 \
+  python3 scripts/serve.py --port 8000
+
+# 1) 服务带着坏盘启动；disk1 healthy=false / fault=superblock_magic_corrupt，
+#    仍按 32 MiB 文件长度计费
+curl -s localhost:8000/disks | python3 scripts/show-status.py
+
+# 2) 发起修复（已知备用块号 4096；标准 256M 样盘用 32768）
+curl -s -X POST localhost:8000/disks/disk1/repair \
+     -H 'content-type: application/json' \
+     -d '{"backup_superblock": 4096}' &
+sleep 0.5
+
+# 3) 修盘期间：本盘扩容 409 disk_busy(repair_in_progress)
+curl -s -X POST localhost:8000/disks/disk1/resize \
+     -H 'content-type: application/json' -d '{"target_mib": 48}'
+
+# 4) 另一盘照常按配额扩容并完成（32 + 64 <= 160）
+curl -s -X POST localhost:8000/disks/disk2/resize \
+     -H 'content-type: application/json' -d '{"target_mib": 64}'
+
+# 5) 非法备用块号 -> 422，原镜像逐字节不变
+curl -s -X POST localhost:8000/disks/disk1/repair \
+     -H 'content-type: application/json' -d '{"backup_superblock": 999999}'
+
+# 6) 替换前崩溃：带 DISK_CRASH_BEFORE_REPLACE=disk1 重启后再发修复，
+#    服务在只读检查通过后、os.replace 前 _exit(137)；sha256 不变。
+#    去掉该变量重启，再次 POST 同一修复即可成功。
+```
+
+### 实测输出（本机 e2fsprogs 1.47.0）
+
+```
+== 1) service starts with the bad disk; GET /disks marks the fault ==
+  quota 160 MiB, used 64.0 MiB, free 96.0 MiB
+  disk1: image 32 MiB, ext4 0 MiB, charged 32 MiB, in_flight False healthy=False  [FAULT=superblock_magic_corrupt]
+  disk2: image 32 MiB, ext4 32 MiB, charged 32 MiB, in_flight False healthy=True
+
+== 2) repair ... concurrently probe expansions ==
+-- disk1 expansion while its repair runs:
+HTTP 409
+  disk_busy repair_in_progress
+-- disk2 expansion to 64 MiB at the same time:
+HTTP 200
+  succeeded ext4_mib= 64
+-- repair result:
+  succeeded backup 4096 len_mib 32 healthy True ext4_mib 32
+
+== 3) invalid backup number changes nothing ==
+HTTP 422
+  invalid_backup_superblock
+  PASS: original image byte-identical
+
+== 4) hard exit before replacement also keeps every byte ==
+  api exit status: 137 (137 = fault injection before replace)
+  PASS: sha256 unchanged by the crashed repair
+
+== 5) restart without the hook and retry ==
+  succeeded healthy True length_mib 32 ext4_mib 32
+
+== 6) original files are still readable ==
+  /data/payload.bin  98304 bytes  e72ddff4…
+  /docs/notes.md     178 bytes    86c64c2e…
+  /readme.txt        101 bytes    8a1ef145…
+```
+
+自动化版本见 `tests/e2e.py` 的 scenario 4–7（故障标记/配额/并发、参数与块大小
+守卫、崩溃重试、256 MiB/32768 标准几何）。
+
+### Docker Compose 下生成故障样盘并修复
+
+Compose 的镜像在命名卷 `disk-images` 里，首次 `up` 生成的 32 MiB 镜像同样没有
+备用块，所以先把 disk1 换成带备份的几何，或直接做“仅魔数损坏 + 32768 不可用”之外
+的标准大镜像实验。最直接的做法是用容器内自带的脚本操作卷内文件：
+
+```bash
+docker compose up -d --build
+
+# 方式 A（推荐）：在卷内把 disk1 重做成 256 MiB 标准几何并损坏主魔数。
+# 先停服务，避免在 mkfs 时并发读；卷由 diskresize 服务独占使用。
+docker compose stop diskresize
+docker compose run --rm --no-deps --entrypoint bash diskresize -c '
+  mkfs.ext4 -q -F -b 4096 -L disk1 -d /srv/seed/disk1 /data/disk1.ext4 256M &&
+  truncate -s 256M /data/disk1.ext4 &&
+  e2fsck -f -y /data/disk1.ext4 >/dev/null &&
+  python3 /srv/scripts/corrupt-superblock.py /data/disk1.ext4'
+docker compose up -d
+
+# 查询：disk1 healthy=false / fault=superblock_magic_corrupt，按 256 MiB 占配额
+curl -s localhost:8000/disks | python3 -m json.tool
+
+# 修复（标准几何的备用超级块号）
+curl -s -X POST localhost:8000/disks/disk1/repair \
+     -H 'content-type: application/json' \
+     -d '{"backup_superblock": 32768}'
+```
+
+> 配额提醒：256 MiB 的故障盘 + 另一张 32 MiB 盘，默认 `DISK_QUOTA_MIB=160`
+> 会让总额显示超限（只影响新扩容准入，不影响查询与修复）。要同时演示 disk2
+> 扩容，请在 `.env` 设 `DISK_QUOTA_MIB=320`。若用紧凑几何
+> （`mkfs.ext4 -b 4096 -g 4096 ... 32M`，备份号 `4096`），默认配额即可。
+
+演示“替换前崩溃”的 Compose 等价流程：
+
+```bash
+# .env 中设置 DISK_CRASH_BEFORE_REPLACE=disk1 后重建容器
+DISK_CRASH_BEFORE_REPLACE=disk1 docker compose up -d --force-recreate
+curl -X POST localhost:8000/disks/disk1/repair \
+     -H 'content-type: application/json' -d '{"backup_superblock": 32768}'
+# 容器按 restart 策略重启后仍带该变量会再次注入；确认原镜像 sha256 未变后，
+# 清空变量并强制重建，再 POST 同一修复即可成功。
+```
+
+---
+
 ## 不启动脚本、只用 Compose 的等价做法
 
 ```bash
