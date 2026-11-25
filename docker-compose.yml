@@ -1,0 +1,34 @@
+services:
+  diskresize:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: offline-ext4-resize:local
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    environment:
+      DISK_QUOTA_MIB: ${DISK_QUOTA_MIB:-160}
+      DISK_IMAGE_MIB: ${DISK_IMAGE_MIB:-32}
+      DISK_EXTEND_DELAY_MS: ${DISK_EXTEND_DELAY_MS:-0}
+      DISK_CRASH_AFTER_EXTEND: ${DISK_CRASH_AFTER_EXTEND:-}
+      DISK_API_KEY: ${DISK_API_KEY:-}
+      DISK_DATA_DIR: /data
+      DISK_STATE_DB: /state/state.db
+    volumes:
+      - disk-images:/data
+      - disk-state:/state
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  disk-images:
+  disk-state:

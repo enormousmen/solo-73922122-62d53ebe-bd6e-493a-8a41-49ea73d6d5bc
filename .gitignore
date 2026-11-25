@@ -1,0 +1,9 @@
+# Local test data (created by scripts/make-images.sh)
+/data/
+/state/
+.e2e-work/
+# Python
+__pycache__/
+*.pyc
+# Local overrides
+.env
